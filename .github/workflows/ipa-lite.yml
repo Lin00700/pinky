@@ -30,6 +30,11 @@ jobs:
       IPA_NAME: pinky-lite-2026.1114.2.ipa
       RELEASE_TAG: ipa-lite-2026.1114.2
     steps:
+      # gh release create looks up the repository through git.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
       - name: Xcode
         run: |
           xcodebuild -version
