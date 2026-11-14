@@ -1,0 +1,153 @@
+# Builds an ad-hoc signed PinkyLite IPA from the upstream iPhone kit so it
+# can be re-signed on a phone (全能签) with the person's own certificate.
+# PinkyLite is the NO_TUNNEL app: no Network Extension. LocalDevVPN on the
+# phone reflects 10.7.0.1. This does not publish a v* Pinky release.
+name: PinkyLite IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [cursor/ipa-lite-532b]
+    paths: [".github/workflows/ipa-lite.yml"]
+
+concurrency:
+  group: ipa-lite-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    name: Build PinkyLite IPA
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      KIT_URL: https://github.com/DIYgod/pinky/releases/download/v2026.1114.2/pinky-iphone-2026.1114.2.tar.gz
+      KIT_SHA256: 28a55b85e0adb54d532d5f63558535cf1d57d023f70c8cbe81717d3769bb4bee
+      BUNDLE_PREFIX: com.lin00700.pinky
+      APP_ID: com.lin00700.pinky.lite
+      IPA_NAME: pinky-lite-2026.1114.2.ipa
+      RELEASE_TAG: ipa-lite-2026.1114.2
+    steps:
+      # gh release create looks up the repository through git.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Xcode
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | awk '/iphoneos/ { print }'
+
+      - name: Download the iPhone kit
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 2 -o kit.tar.gz "$KIT_URL"
+          echo "$KIT_SHA256  kit.tar.gz" | shasum -a 256 -c
+          tar -xzf kit.tar.gz
+          test -d pinky-iphone/Pinky.xcodeproj
+          test -f pinky-iphone/build/core/libpinkycore.a
+
+      - name: Build PinkyLite unsigned
+        run: |
+          set -euo pipefail
+          cd pinky-iphone
+          # No shared scheme is in the kit. The PinkyLite target pulls in
+          # PinkyActivityLite and does not embed the packet tunnel.
+          # -derivedDataPath requires a scheme, and the kit ships none.
+          # CONFIGURATION_BUILD_DIR puts PinkyLite.app in one known folder.
+          xcodebuild \
+            -project Pinky.xcodeproj \
+            -target PinkyLite \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            "PINKY_BUNDLE_ID=$BUNDLE_PREFIX" \
+            "CONFIGURATION_BUILD_DIR=$RUNNER_TEMP/dd" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+          app="$RUNNER_TEMP/dd/PinkyLite.app"
+          test -d "$app"
+          echo "APP=$app" >> "$GITHUB_ENV"
+
+      - name: Ad-hoc sign and pack the IPA
+        run: |
+          set -euo pipefail
+          app="${APP}"
+          stage="$RUNNER_TEMP/ipa"
+          rm -rf "$stage"
+          mkdir -p "$stage/Payload"
+          cp -R "$app" "$stage/Payload/PinkyLite.app"
+          xattr -cr "$stage/Payload/PinkyLite.app" || true
+          ent="$RUNNER_TEMP/empty.entitlements"
+          cat > "$ent" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict/></plist>
+          EOF
+          # Inside out. Empty entitlements: no packet-tunnel, no app group.
+          # 全能签 replaces this signature with the person's certificate.
+          find "$stage/Payload/PinkyLite.app" -name '*.appex' -print | while read -r plug; do
+            codesign --force --sign - --timestamp=none --generate-entitlement-der --entitlements "$ent" "$plug"
+          done
+          codesign --force --sign - --timestamp=none --generate-entitlement-der --entitlements "$ent" "$stage/Payload/PinkyLite.app"
+          codesign --verify --verbose=2 "$stage/Payload/PinkyLite.app"
+          bid=$(plutil -extract CFBundleIdentifier raw -o - "$stage/Payload/PinkyLite.app/Info.plist")
+          echo "bundle id: $bid"
+          test "$bid" = "$APP_ID"
+          ents=$(codesign -d --entitlements :- "$stage/Payload/PinkyLite.app" 2>&1 || true)
+          echo "$ents"
+          echo "$ents" | grep -q 'packet-tunnel' && {
+            echo "packet-tunnel entitlement leaked into the lite app" >&2
+            exit 1
+          }
+          file "$stage/Payload/PinkyLite.app/PinkyLite"
+          mkdir -p dist
+          (cd "$stage" && zip -r -X -y "$GITHUB_WORKSPACE/dist/$IPA_NAME" Payload)
+          (cd dist && shasum -a 256 "$IPA_NAME" | tee SHA256SUMS)
+          ls -l "dist/$IPA_NAME"
+          unzip -l "dist/$IPA_NAME" | head
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pinky-lite-ipa
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sum=$(awk '{ print $1 }' dist/SHA256SUMS)
+          size=$(stat -f %z "dist/$IPA_NAME")
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<EOF
+          Ad-hoc signed PinkyLite IPA from the upstream kit pinky-iphone-2026.1114.2.tar.gz ($KIT_SHA256).
+
+          - Bundle id: $APP_ID (Live Activity: ${APP_ID}.activity)
+          - SHA-256: $sum
+          - Size: $size bytes
+          - No Network Extension / packet-tunnel entitlement. Re-sign with your own certificate (全能签). WebDriverAgent is not inside this IPA.
+
+          The phone still needs LocalDevVPN (10.7.0.2 / 10.7.0.1 /30), Developer Mode, a mounted developer disk image, pairing (on the phone on iOS 27), and a model API key. A free Apple ID profile lasts about 7 days.
+
+          This is not a v* Pinky desktop release.
+          EOF
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "dist/$IPA_NAME" dist/SHA256SUMS --clobber
+            gh release edit "$RELEASE_TAG" --notes-file "$notes"
+          else
+            gh release create "$RELEASE_TAG" "dist/$IPA_NAME" dist/SHA256SUMS \
+              --target "$GITHUB_SHA" \
+              --title "PinkyLite IPA 2026.1114.2" \
+              --notes-file "$notes"
+          fi
+          gh release view "$RELEASE_TAG" --json url,tagName,assets
